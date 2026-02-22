@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { speakText } from '../services/gemini';
+import { speakText, speakWithWebSpeech } from '../services/gemini';
 import {
   bciSocket,
   getPhrases,
@@ -180,19 +180,39 @@ const P300Grid: React.FC = () => {
 
       bciSocket.on('sentence_auto_sent', (e: BCIEvent) => {
         const text = e.data.sentence_text || '';
-        setLastEvent(`Auto-sent: "${text}"`);
         setSelectedSlots({});
         setGrammarStep('subject');
         setGrammarStepIndex(0);
         if (text) {
-          speakText(text).then((audioDataUrl) => {
+          setIsSpeaking(true);
+          setLastEvent('Speaking...');
+          speakText(text).then(async (audioDataUrl) => {
             if (audioDataUrl) {
               const audio = new Audio(audioDataUrl);
               audioRef.current = audio;
-              audio.onended = () => { audioRef.current = null; };
-              audio.play();
+              audio.onended = () => {
+                setIsSpeaking(false);
+                audioRef.current = null;
+                setLastEvent(`Spoke: "${text}"`);
+              };
+              try {
+                await audio.play();
+              } catch {
+                audioRef.current = null;
+                await speakWithWebSpeech(text);
+                setIsSpeaking(false);
+                setLastEvent(`Spoke: "${text}"`);
+              }
+            } else {
+              setIsSpeaking(false);
+              setLastEvent(`Spoke: "${text}"`);
             }
-          }).catch(() => {});
+          }).catch(() => {
+            setIsSpeaking(false);
+            setLastEvent(`Auto-sent: "${text}"`);
+          });
+        } else {
+          setLastEvent('Auto-sent');
         }
       }),
 
@@ -331,7 +351,13 @@ const P300Grid: React.FC = () => {
             setIsSpeaking(false);
             audioRef.current = null;
           };
-          audio.play();
+          try {
+            await audio.play();
+          } catch {
+            audioRef.current = null;
+            await speakWithWebSpeech(text);
+            setIsSpeaking(false);
+          }
         } else {
           setIsSpeaking(false);
         }
