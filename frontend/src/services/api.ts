@@ -62,9 +62,16 @@ export async function getStatus(): Promise<SystemStatus> {
   return fetchJSON("/status");
 }
 
-export async function getPhrases(): Promise<string[]> {
-  const data = await fetchJSON<{ phrases: string[] }>("/phrases");
-  return data.phrases;
+export interface PhrasesResponse {
+  phrases: string[];
+  grammar_step?: string;
+  grammar_step_index?: number;
+  skippable?: boolean;
+  selected_slots?: Record<string, string>;
+}
+
+export async function getPhrases(): Promise<PhrasesResponse> {
+  return fetchJSON<PhrasesResponse>("/phrases");
 }
 
 export async function confirmPhrase(index: number): Promise<{
@@ -75,23 +82,9 @@ export async function confirmPhrase(index: number): Promise<{
   return fetchJSON(`/phrases/confirm/${index}`, { method: "POST" });
 }
 
-export interface SentenceCheck {
-  complete: boolean;
-  meaningful: boolean;
-  suggestion: string;
-}
-
-export async function checkSentence(): Promise<SentenceCheck> {
-  return fetchJSON("/sentence/check");
-}
-
 export async function getHistory(): Promise<string[]> {
   const data = await fetchJSON<{ history: string[] }>("/history");
   return data.history;
-}
-
-export async function clearAllHistory(): Promise<void> {
-  await fetchJSON("/history", { method: "DELETE" });
 }
 
 export async function deleteLastPhrase(): Promise<{
@@ -249,6 +242,44 @@ export async function getLiveTestStatus(): Promise<{
   model_loaded: boolean;
 }> {
   return fetchJSON("/dl/live-test/status");
+}
+
+// ── Blink-to-Select API ─────────────────────────────────────
+
+export interface SelectionStatus {
+  state: string;
+  highlight_index: number;
+  blink_threshold: number;
+  calibration_blinks: number;
+  phrases: string[];
+  grammar_step?: string;
+  grammar_step_index?: number;
+  skippable?: boolean;
+  selected_slots?: Record<string, string>;
+}
+
+export async function startSelection(): Promise<any> {
+  return fetchJSON("/selection/start", { method: "POST" });
+}
+
+export async function stopSelection(): Promise<any> {
+  return fetchJSON("/selection/stop", { method: "POST" });
+}
+
+export async function getSelectionStatus(): Promise<SelectionStatus> {
+  return fetchJSON("/selection/status");
+}
+
+export async function doneSend(): Promise<{ status: string; sentence: string }> {
+  return fetchJSON("/selection/done", { method: "POST" });
+}
+
+export async function getSentence(): Promise<{ sentence: string[]; text: string }> {
+  return fetchJSON("/sentence");
+}
+
+export async function clearSentence(): Promise<{ status: string }> {
+  return fetchJSON("/sentence/clear", { method: "POST" });
 }
 
 // ── WebSocket ────────────────────────────────────────────────

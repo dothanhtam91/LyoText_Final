@@ -14,24 +14,23 @@ interface DataPoint {
   tp10: number;
 }
 
-const MAX_POINTS = 60;
+const MAX_POINTS = 200;
 
 const EEGMonitor: React.FC<EEGMonitorProps> = ({ isFlashing }) => {
   const [data, setData] = useState<DataPoint[]>([]);
   const [blinkCount, setBlinkCount] = useState(0);
   const [clenchCount, setClenchCount] = useState(0);
-  const [channel, setChannel] = useState<'af7' | 'af8' | 'tp9' | 'tp10'>('af7');
   const timeRef = useRef(0);
   const wsSubscribedRef = useRef(false);
+  const pendingRef = useRef<DataPoint[]>([]);
+  const rafRef = useRef<number | null>(null);
 
-  // Subscribe to EEG stream via WebSocket — re-subscribe on every reconnect
   useEffect(() => {
     const sendSub = () => {
       bciSocket.subscribeEEG();
       wsSubscribedRef.current = true;
     };
 
-    // Subscribe immediately if already connected, otherwise wait for open
     if (bciSocket.connected) {
       sendSub();
     }
@@ -40,17 +39,23 @@ const EEGMonitor: React.FC<EEGMonitorProps> = ({ isFlashing }) => {
     const unsubEEG = bciSocket.on('eeg_sample', (e: BCIEvent) => {
       const sample = e.data;
       timeRef.current += 1;
-      setData(prev => {
-        const next = [...prev, {
-          time: timeRef.current,
-          af7: sample.af7 ?? 0,
-          af8: sample.af8 ?? 0,
-          tp9: sample.tp9 ?? 0,
-          tp10: sample.tp10 ?? 0,
-        }];
-        if (next.length > MAX_POINTS) next.shift();
-        return next;
+      pendingRef.current.push({
+        time: timeRef.current,
+        af7: sample.af7 ?? 0,
+        af8: sample.af8 ?? 0,
+        tp9: sample.tp9 ?? 0,
+        tp10: sample.tp10 ?? 0,
       });
+      if (rafRef.current === null) {
+        rafRef.current = requestAnimationFrame(() => {
+          rafRef.current = null;
+          const batch = pendingRef.current;
+          pendingRef.current = [];
+          if (batch.length > 0) {
+            setData(prev => [...prev, ...batch].slice(-MAX_POINTS));
+          }
+        });
+      }
     });
 
     const unsubBlink = bciSocket.on('blink_detected', () => {
@@ -66,6 +71,7 @@ const EEGMonitor: React.FC<EEGMonitorProps> = ({ isFlashing }) => {
       unsubEEG();
       unsubBlink();
       unsubClench();
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
   }, []);
 
@@ -75,15 +81,15 @@ const EEGMonitor: React.FC<EEGMonitorProps> = ({ isFlashing }) => {
 
     const interval = setInterval(() => {
       timeRef.current += 1;
-      const noise = (Math.random() - 0.5) * 10;
+      const t = timeRef.current * 0.1;
       const spike = isFlashing && Math.random() > 0.95 ? 50 : 0;
       setData(prev => {
         const next = [...prev, {
           time: timeRef.current,
-          af7: noise + spike,
-          af8: noise * 0.9,
-          tp9: noise * 1.1,
-          tp10: noise * 0.8,
+          af7: (Math.random() - 0.5) * 12 + 8 * Math.sin(2 * Math.PI * 0.8 * t) + spike,
+          af8: (Math.random() - 0.5) * 10 + 6 * Math.sin(2 * Math.PI * 1.2 * t + 1.0),
+          tp9: (Math.random() - 0.5) * 14 + 7 * Math.sin(2 * Math.PI * 1.5 * t + 2.5),
+          tp10: (Math.random() - 0.5) * 11 + 5 * Math.sin(2 * Math.PI * 0.6 * t + 4.0),
         }];
         if (next.length > MAX_POINTS) next.shift();
         return next;
@@ -100,32 +106,14 @@ const EEGMonitor: React.FC<EEGMonitorProps> = ({ isFlashing }) => {
     { key: 'tp10', label: 'TP10', color: '#f59e0b' },
   ];
 
-  const activeChannel = channels.find(c => c.key === channel)!;
-
   return (
-    <div className="w-full h-52 bg-white/90 rounded-2xl p-4 border-4 border-blue-200 shadow-xl backdrop-blur-sm">
+    <div className="w-full bg-white/90 rounded-2xl p-4 border-4 border-blue-200 shadow-xl backdrop-blur-sm">
       <div className="flex justify-between items-center mb-2">
         <div className="flex items-center gap-3">
           <h3 className="text-blue-500 font-bold text-xs tracking-widest uppercase flex items-center gap-2">
             <div className={`w-2 h-2 rounded-full ${isFlashing ? 'bg-red-500 animate-pulse' : 'bg-blue-400'}`}></div>
             EEG Signal
           </h3>
-          {/* Channel selector */}
-          <div className="flex gap-1">
-            {channels.map(ch => (
-              <button
-                key={ch.key}
-                onClick={() => setChannel(ch.key)}
-                className={`text-[9px] font-bold px-1.5 py-0.5 rounded transition-all ${
-                  channel === ch.key
-                    ? 'bg-blue-500 text-white'
-                    : 'bg-zinc-100 text-zinc-400 hover:bg-zinc-200'
-                }`}
-              >
-                {ch.label}
-              </button>
-            ))}
-          </div>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[9px] font-bold text-blue-400">
@@ -136,20 +124,34 @@ const EEGMonitor: React.FC<EEGMonitorProps> = ({ isFlashing }) => {
           </span>
         </div>
       </div>
-      <ResponsiveContainer width="100%" height="85%">
-        <LineChart data={data}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#93c5fd" opacity={0.3} />
-          <YAxis domain={[-80, 80]} hide />
-          <Line
-            type="monotone"
-            dataKey={channel}
-            stroke={isFlashing ? "#ef4444" : activeChannel.color}
-            strokeWidth={2}
-            dot={false}
-            isAnimationActive={false}
-          />
-        </LineChart>
-      </ResponsiveContainer>
+      <div className="flex flex-col gap-0.5">
+        {channels.map(ch => (
+          <div key={ch.key} className="flex items-center gap-1">
+            <div className="w-10 flex items-center justify-end pr-1 shrink-0">
+              <span className="text-[9px] font-bold flex items-center gap-1" style={{ color: ch.color }}>
+                <span className="w-1.5 h-1.5 rounded-full inline-block" style={{ backgroundColor: ch.color }}></span>
+                {ch.label}
+              </span>
+            </div>
+            <div className="flex-1 h-[72px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={data} margin={{ top: 2, right: 4, bottom: 2, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#93c5fd" opacity={0.15} />
+                  <YAxis domain={[-80, 80]} hide />
+                  <Line
+                    type="monotone"
+                    dataKey={ch.key}
+                    stroke={ch.color}
+                    strokeWidth={1.5}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 };

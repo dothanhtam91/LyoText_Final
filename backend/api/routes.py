@@ -63,49 +63,96 @@ async def get_status() -> StatusResponse:
 @router.get("/phrases")
 async def get_phrases() -> dict[str, Any]:
     phrases = await phrase_engine.generate_phrases()
-    return {"phrases": phrases}
+    return {
+        "phrases": phrases,
+        "grammar_step": phrase_engine.current_step_name,
+        "grammar_step_index": phrase_engine.step_index,
+        "skippable": phrase_engine.is_skippable,
+        "selected_slots": phrase_engine.selected_slots,
+    }
 
 
 @router.post("/phrases/confirm/{index}")
 async def confirm_phrase(index: int) -> dict[str, Any]:
+    from llm.phrase_engine import OTHER_LABEL, SKIP_LABEL
     phrases = await phrase_engine.generate_phrases()
     if index < 0 or index >= len(phrases):
         raise HTTPException(status_code=400, detail="Invalid phrase index")
     phrase = phrases[index]
-    phrase_engine.confirm_phrase(phrase)
 
+    if phrase == SKIP_LABEL:
+        phrase_engine.skip_step()
+        new_phrases = await phrase_engine.generate_phrases()
+        event_bus.emit(Event(
+            type=EventType.GRAMMAR_STEP_CHANGED,
+            data={
+                "step": phrase_engine.current_step_name,
+                "step_index": phrase_engine.step_index,
+                "skippable": phrase_engine.is_skippable,
+                "selected_slots": phrase_engine.selected_slots,
+            },
+        ))
+        return {
+            "confirmed": "Skip",
+            "history": phrase_engine.history,
+            "new_phrases": new_phrases,
+            "grammar_step": phrase_engine.current_step_name,
+            "selected_slots": phrase_engine.selected_slots,
+        }
+
+    if phrase == OTHER_LABEL:
+        new_words = await phrase_engine.generate_other_words()
+        new_phrases = await phrase_engine.generate_phrases()
+        event_bus.emit(Event(
+            type=EventType.WORDS_UPDATED,
+            data={
+                "words": new_words, "phrases": new_phrases,
+                "sentence": phrase_engine.sentence,
+                "grammar_step": phrase_engine.current_step_name,
+                "selected_slots": phrase_engine.selected_slots,
+            },
+        ))
+        return {
+            "confirmed": "Other",
+            "history": phrase_engine.history,
+            "new_phrases": new_phrases,
+            "grammar_step": phrase_engine.current_step_name,
+            "selected_slots": phrase_engine.selected_slots,
+        }
+
+    phrase_engine.select_word(phrase)
     event_bus.emit(Event(
-        type=EventType.PHRASE_CONFIRMED,
-        data={"phrase": phrase, "history": phrase_engine.history},
+        type=EventType.WORD_SELECTED,
+        data={
+            "word": phrase, "sentence": phrase_engine.sentence,
+            "grammar_step": phrase_engine.current_step_name,
+            "selected_slots": phrase_engine.selected_slots,
+        },
     ))
 
     new_phrases = await phrase_engine.generate_phrases()
     event_bus.emit(Event(
-        type=EventType.PHRASES_UPDATED,
-        data={"phrases": new_phrases},
+        type=EventType.WORDS_UPDATED,
+        data={
+            "words": phrase_engine.get_current_words(), "phrases": new_phrases,
+            "sentence": phrase_engine.sentence,
+            "grammar_step": phrase_engine.current_step_name,
+            "selected_slots": phrase_engine.selected_slots,
+        },
     ))
 
-    return {"confirmed": phrase, "history": phrase_engine.history, "new_phrases": new_phrases}
-
-
-@router.get("/sentence/check")
-async def check_sentence() -> dict[str, Any]:
-    return await phrase_engine.check_sentence()
+    return {
+        "confirmed": phrase,
+        "history": phrase_engine.history,
+        "new_phrases": new_phrases,
+        "grammar_step": phrase_engine.current_step_name,
+        "selected_slots": phrase_engine.selected_slots,
+    }
 
 
 @router.get("/history")
 async def get_history() -> dict[str, Any]:
     return {"history": phrase_engine.history}
-
-
-@router.delete("/history")
-async def clear_history() -> dict[str, str]:
-    phrase_engine.clear_history()
-    event_bus.emit(Event(
-        type=EventType.PHRASES_UPDATED,
-        data={"phrases": phrase_engine._fallback_phrases(config.NUM_PHRASES)},
-    ))
-    return {"status": "cleared"}
 
 
 @router.delete("/history/last")
@@ -477,3 +524,66 @@ async def live_test_status(request: Request) -> dict[str, Any]:
         "active": orch.live_test_active,
         "model_loaded": deep_trainer.gesture_model is not None,
     }
+
+
+# ── Sentence ─────────────────────────────────────────────────
+
+@router.get("/sentence")
+async def get_sentence() -> dict[str, Any]:
+    """Get the current sentence words."""
+    return {
+        "sentence": phrase_engine.sentence,
+        "text": phrase_engine.sentence_text,
+        "grammar_step": phrase_engine.current_step_name,
+        "selected_slots": phrase_engine.selected_slots,
+    }
+
+
+@router.post("/sentence/clear")
+async def clear_sentence() -> dict[str, Any]:
+    """Clear the current sentence without speaking."""
+    phrase_engine.clear_sentence()
+    event_bus.emit(Event(
+        type=EventType.SENTENCE_CLEARED,
+        data={"spoken": ""},
+    ))
+    event_bus.emit(Event(
+        type=EventType.GRAMMAR_STEP_CHANGED,
+        data={
+            "step": phrase_engine.current_step_name,
+            "step_index": phrase_engine.step_index,
+            "skippable": phrase_engine.is_skippable,
+            "selected_slots": {},
+        },
+    ))
+    return {"status": "cleared", "sentence": [], "grammar_step": "subject"}
+
+
+# ── Blink-to-Select ──────────────────────────────────────────
+
+@router.post("/selection/start")
+async def start_selection(request: Request) -> dict[str, Any]:
+    """Begin warmup -> calibration -> sequential highlighting cycle."""
+    orch = request.app.state.orchestrator
+    return orch.start_selection()
+
+
+@router.post("/selection/stop")
+async def stop_selection(request: Request) -> dict[str, Any]:
+    """Full session stop."""
+    orch = request.app.state.orchestrator
+    return orch.stop_selection()
+
+
+@router.get("/selection/status")
+async def selection_status(request: Request) -> dict[str, Any]:
+    """Get current selection state, highlight index, threshold."""
+    orch = request.app.state.orchestrator
+    return orch.selection_status
+
+
+@router.post("/selection/done")
+async def done_send(request: Request) -> dict[str, Any]:
+    """Done/Send: speak sentence, clear it, continue looping."""
+    orch = request.app.state.orchestrator
+    return orch.done_send()
