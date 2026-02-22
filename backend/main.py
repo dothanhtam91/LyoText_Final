@@ -84,6 +84,8 @@ class BCIOrchestrator:
         self._eegnet_blink_conf = 0.0
         self._eegnet_clench_time = 0.0
         self._eegnet_clench_conf = 0.0
+        self._last_voted_gesture = "idle"
+        self._last_gesture_fire_time = 0.0
 
         # Selection state machine
         self._sel_state = SelectionState.IDLE
@@ -382,7 +384,6 @@ class BCIOrchestrator:
             self._last_clench_action_time = now
             self._last_p300_selection = None
             self._flasher.reset_highlight()
-            self._schedule_next_cycle(delay=0.5)
             return
 
         if self._clench_pending_time > 0 and (now - self._clench_pending_time) < DOUBLE_CLENCH_WINDOW_SEC:
@@ -445,22 +446,34 @@ class BCIOrchestrator:
             data = _np2.pad(data, ((pad, 0), (0, 0)), mode="edge")
         return data.T
 
-    _CONFIDENCE_THRESHOLD = 0.63
+    _CONFIDENCE_THRESHOLD = 0.80
     _VOTE_WINDOW = 9
+    _SUPERMAJORITY = 7          # need 7/9 votes for a gesture to win
+    _GESTURE_REFRACTORY_SEC = 3.0  # cooldown before the same gesture can fire again
 
     def _majority_vote(self) -> tuple[str, float]:
-        """Return the majority class and its average confidence from the vote buffer."""
+        """Return the majority class and its average confidence, requiring a supermajority."""
         from collections import Counter
         if not self._gesture_vote_buffer:
             return "idle", 0.0
         names = [name for _, name, _ in self._gesture_vote_buffer]
         counts = Counter(names)
-        winner, _ = counts.most_common(1)[0]
+        winner, count = counts.most_common(1)[0]
+        if count < self._SUPERMAJORITY:
+            return "idle", 0.0
         winner_confs = [c for _, n, c in self._gesture_vote_buffer if n == winner]
         return winner, sum(winner_confs) / len(winner_confs)
 
     def _run_gesture_classification(self) -> None:
-        """Use the trained gesture model to detect blinks/clenches from raw EEG."""
+        """Use the trained gesture model to detect blinks/clenches from raw EEG.
+
+        Guards against false positives with four layers:
+        1. Per-frame confidence threshold — low-confidence frames become "idle"
+        2. Full vote window required — must accumulate 9 consecutive predictions
+        3. Supermajority — 7/9 windows must agree on the gesture class
+        4. Transition-based firing — only fires on idle→gesture state change,
+           NOT on sustained predictions (prevents auto-repeat from model bias)
+        """
         try:
             window = self._get_raw_window()
             if window is None:
@@ -497,15 +510,27 @@ class BCIOrchestrator:
                     },
                 ))
 
+            prev_gesture = self._last_voted_gesture
+            self._last_voted_gesture = voted_name
+
             if voted_name == "idle" or voted_conf < self._CONFIDENCE_THRESHOLD:
                 return
 
-            # Require the full vote window to be populated before firing any gesture
-            # so a single high-confidence frame cannot trigger immediately on startup.
             if len(self._gesture_vote_buffer) < self._VOTE_WINDOW:
                 return
 
+            # Only fire on a STATE TRANSITION (idle/other → this gesture).
+            # If the model keeps predicting "clench" every cycle, it fires
+            # exactly once on the first transition, then stops until the
+            # user releases (idle) and clenches again.
+            if prev_gesture == voted_name:
+                return
+
             now = time.time()
+            if now - self._last_gesture_fire_time < self._GESTURE_REFRACTORY_SEC:
+                return
+
+            self._last_gesture_fire_time = now
             logger.info("Gesture detected: %s (voted_conf=%.2f)", voted_name, voted_conf)
 
             if voted_name == "blink":

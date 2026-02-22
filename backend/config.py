@@ -29,7 +29,7 @@ NUM_PHRASES = 6           # phrases displayed at once
 BLINK_THRESHOLD_UV = 150      # peak amplitude on AF7/AF8
 BLINK_REFRACTORY_MS = 500     # minimum gap between blink events
 CLENCH_RMS_THRESHOLD = 60     # RMS threshold on TP9/TP10 (lowered for easier detection)
-CLENCH_MIN_DURATION_MS = 300  # sustained above threshold (lowered for shorter clench)
+CLENCH_MIN_DURATION_MS = 280  # sustained above threshold (lowered for shorter clench)
 
 # ── Classifier ───────────────────────────────────────────────
 MODEL_PATH = str(BASE_DIR / "models" / "p300_lda.joblib")
