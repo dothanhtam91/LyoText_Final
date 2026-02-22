@@ -62,9 +62,16 @@ export async function getStatus(): Promise<SystemStatus> {
   return fetchJSON("/status");
 }
 
-export async function getPhrases(): Promise<string[]> {
-  const data = await fetchJSON<{ phrases: string[] }>("/phrases");
-  return data.phrases;
+export interface PhrasesResponse {
+  phrases: string[];
+  grammar_step?: string;
+  grammar_step_index?: number;
+  skippable?: boolean;
+  selected_slots?: Record<string, string>;
+}
+
+export async function getPhrases(): Promise<PhrasesResponse> {
+  return fetchJSON<PhrasesResponse>("/phrases");
 }
 
 export async function confirmPhrase(index: number): Promise<{
@@ -245,6 +252,10 @@ export interface SelectionStatus {
   blink_threshold: number;
   calibration_blinks: number;
   phrases: string[];
+  grammar_step?: string;
+  grammar_step_index?: number;
+  skippable?: boolean;
+  selected_slots?: Record<string, string>;
 }
 
 export async function startSelection(): Promise<any> {

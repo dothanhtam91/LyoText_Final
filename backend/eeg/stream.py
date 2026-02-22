@@ -150,9 +150,11 @@ class EEGStream:
             )
 
             noise = rng.normal(0, 10, (chunk_size, config.NUM_CHANNELS))
-            alpha = 5 * np.sin(
-                2 * np.pi * 10 * timestamps_np[:, None]
-                * np.ones((1, config.NUM_CHANNELS))
+            freqs = np.array([8.0, 10.0, 12.0, 14.0])
+            amps = np.array([6.0, 5.0, 7.0, 4.5])
+            phases = np.array([0.0, 0.8, 1.6, 2.4])
+            alpha = amps * np.sin(
+                2 * np.pi * freqs * timestamps_np[:, None] + phases
             )
             samples_np = noise + alpha
 

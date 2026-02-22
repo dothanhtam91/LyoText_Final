@@ -34,6 +34,10 @@ class EventType(str, Enum):
     WORD_SELECTED = "word_selected"
     SENTENCE_CLEARED = "sentence_cleared"
     SESSION_STOPPED = "session_stopped"
+    GRAMMAR_STEP_CHANGED = "grammar_step_changed"
+    CLENCH_CALIBRATION_STATUS = "clench_calibration_status"
+    SENTENCE_AUTO_SENT = "sentence_auto_sent"
+    CLENCH_PENDING = "clench_pending"
 
 
 @dataclass

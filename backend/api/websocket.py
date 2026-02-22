@@ -14,7 +14,7 @@ from utils.events import Event, EventType, event_bus
 logger = logging.getLogger(__name__)
 
 
-_EEG_DOWNSAMPLE = 8  # forward 1 in every N samples → 256Hz / 8 = 32Hz to frontend
+_EEG_DOWNSAMPLE = 4  # forward 1 in every N samples → 256Hz / 4 = 64Hz to frontend
 
 
 class WebSocketManager:
@@ -45,6 +45,10 @@ class WebSocketManager:
         event_bus.on(EventType.WORD_SELECTED, self._on_event)
         event_bus.on(EventType.SENTENCE_CLEARED, self._on_event)
         event_bus.on(EventType.SESSION_STOPPED, self._on_event)
+        event_bus.on(EventType.GRAMMAR_STEP_CHANGED, self._on_event)
+        event_bus.on(EventType.CLENCH_CALIBRATION_STATUS, self._on_event)
+        event_bus.on(EventType.SENTENCE_AUTO_SENT, self._on_event)
+        event_bus.on(EventType.CLENCH_PENDING, self._on_event)
         event_bus.on(EventType.EEG_SAMPLE, self._on_eeg_sample)
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:

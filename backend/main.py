@@ -31,7 +31,7 @@ from eeg.classifier import p300_classifier
 from eeg.deep_trainer import deep_trainer
 from eeg.processing import signal_processor
 from eeg.stream import eeg_stream
-from llm.phrase_engine import OTHER_LABEL, phrase_engine
+from llm.phrase_engine import OTHER_LABEL, SKIP_LABEL, phrase_engine
 from stimulus.flasher import StimulusFlasher
 from utils.events import Event, EventType, event_bus
 
@@ -46,6 +46,7 @@ class SelectionState(str, Enum):
     IDLE = "idle"
     WARMUP = "warmup"
     CALIBRATING = "calibrating"
+    CLENCH_CALIBRATING = "clench_calibrating"
     HIGHLIGHTING = "highlighting"
     CONFIRMING = "confirming"
     EXECUTING = "executing"
@@ -54,6 +55,10 @@ class SelectionState(str, Enum):
 HIGHLIGHT_DURATION = 2.0
 WARMUP_DURATION = 2.0
 CALIBRATION_BLINKS = 2
+CALIBRATION_CLENCHES = 3
+CLENCH_COOLDOWN_SEC = 1.0
+CLENCH_IDLE_GUARD_SEC = 0.3
+DOUBLE_CLENCH_WINDOW_SEC = 2.0
 DEBOUNCE_PERIOD = 1.5
 CONFIRM_DISPLAY_SEC = 1.5
 DEFAULT_BLINK_THRESHOLD = 100.0
@@ -74,6 +79,12 @@ class BCIOrchestrator:
         self._live_test_active = False
         self._gesture_vote_buffer: list[tuple[int, str, float]] = []
 
+        # EEGNet-based gesture detection results
+        self._eegnet_blink_time = 0.0
+        self._eegnet_blink_conf = 0.0
+        self._eegnet_clench_time = 0.0
+        self._eegnet_clench_conf = 0.0
+
         # Selection state machine
         self._sel_state = SelectionState.IDLE
         self._sel_warmup_start = 0.0
@@ -86,6 +97,14 @@ class BCIOrchestrator:
         self._sel_last_blink_time = 0.0
         self._sel_confirmed_index = -1
         self._sel_confirm_start = 0.0
+
+        # Clench gating & calibration
+        self._last_clench_action_time = 0.0
+        self._clench_pending_time = 0.0
+        self._clench_cal_count = 0
+        self._clench_cal_rms_values: list[float] = []
+        self._clench_cal_last_time = 0.0
+        self._dynamic_clench_threshold: float | None = None
 
     def start(self) -> None:
         self._running = True
@@ -133,21 +152,13 @@ class BCIOrchestrator:
 
     async def _load_initial_phrases(self) -> None:
         try:
-            words = await phrase_engine.generate_words()
-            self._current_phrases = words + [OTHER_LABEL]
+            words = phrase_engine.get_words_for_step()
+            labels = [OTHER_LABEL]
+            if phrase_engine.is_skippable:
+                labels.insert(0, SKIP_LABEL)
+            self._current_phrases = words + labels
             self._flasher.set_phrases(self._current_phrases)
-            event_bus.emit(Event(
-                type=EventType.PHRASES_UPDATED,
-                data={"phrases": self._current_phrases},
-            ))
-            event_bus.emit(Event(
-                type=EventType.WORDS_UPDATED,
-                data={
-                    "words": words,
-                    "phrases": self._current_phrases,
-                    "sentence": [],
-                },
-            ))
+            self._emit_grammar_update(words)
             logger.info("Initial words loaded: %s", self._current_phrases)
 
             if p300_classifier.is_trained:
@@ -155,6 +166,30 @@ class BCIOrchestrator:
                 self._start_flash_cycle()
         except Exception:
             logger.exception("Failed to load initial words")
+
+    def _emit_grammar_update(self, words: list[str]) -> None:
+        """Emit grammar-aware WORDS_UPDATED and GRAMMAR_STEP_CHANGED events."""
+        event_bus.emit(Event(
+            type=EventType.WORDS_UPDATED,
+            data={
+                "words": words,
+                "phrases": self._current_phrases,
+                "sentence": phrase_engine.sentence,
+                "grammar_step": phrase_engine.current_step_name,
+                "grammar_step_index": phrase_engine.step_index,
+                "skippable": phrase_engine.is_skippable,
+                "selected_slots": phrase_engine.selected_slots,
+            },
+        ))
+        event_bus.emit(Event(
+            type=EventType.GRAMMAR_STEP_CHANGED,
+            data={
+                "step": phrase_engine.current_step_name,
+                "step_index": phrase_engine.step_index,
+                "skippable": phrase_engine.is_skippable,
+                "selected_slots": phrase_engine.selected_slots,
+            },
+        ))
 
     def stop(self) -> None:
         self._running = False
@@ -216,8 +251,8 @@ class BCIOrchestrator:
             interval = 0.25
             if (
                 deep_trainer.gesture_model is not None
-                and self._sel_state == SelectionState.IDLE
                 and (self._live_test_active or not self._flash_active)
+                and (self._live_test_active or self._sel_state != SelectionState.IDLE)
                 and now - last_gesture_check >= interval
             ):
                 last_gesture_check = now
@@ -337,42 +372,58 @@ class BCIOrchestrator:
         if self._flash_active:
             return
 
-        removed = phrase_engine.delete_last()
-        if removed:
-            logger.info("Phrase deleted by jaw clench: '%s'", removed)
-            self._last_p300_selection = None
-            event_bus.emit(Event(
-                type=EventType.PHRASE_DELETED,
-                data={"removed": removed, "history": phrase_engine.history},
-            ))
-            try:
-                redis_store.push_event("phrase_deleted", {"removed": removed})
-            except Exception:
-                pass
-            self._flasher.reset_highlight()
-            self._refresh_phrases_and_flash()
-        else:
+        now = time.time()
+        if now - self._last_clench_action_time < CLENCH_COOLDOWN_SEC:
+            return
+        if now - self._sel_last_blink_time < CLENCH_IDLE_GUARD_SEC:
+            return
+
+        if not phrase_engine.has_selections():
+            self._last_clench_action_time = now
             self._last_p300_selection = None
             self._flasher.reset_highlight()
             self._schedule_next_cycle(delay=0.5)
+            return
+
+        if self._clench_pending_time > 0 and (now - self._clench_pending_time) < DOUBLE_CLENCH_WINDOW_SEC:
+            self._clench_pending_time = 0.0
+            self._last_clench_action_time = now
+            logger.info("Sentence cleared by double jaw clench")
+            phrase_engine.clear_sentence()
+            self._last_p300_selection = None
+            event_bus.emit(Event(
+                type=EventType.SENTENCE_CLEARED,
+                data={"spoken": ""},
+            ))
+            try:
+                redis_store.push_event("sentence_cleared", {"action": "double_clench"})
+            except Exception:
+                pass
+            self._flasher.reset_highlight()
+            self._refresh_grammar_words_and_resume()
+        else:
+            self._clench_pending_time = now
+            self._last_clench_action_time = now
+            logger.info("First clench detected — waiting for second clench to confirm delete")
+            event_bus.emit(Event(
+                type=EventType.CLENCH_PENDING,
+                data={"message": "Clench again to clear"},
+            ))
 
     def _refresh_phrases_and_flash(self) -> None:
         def _do():
-            loop = asyncio.new_event_loop()
             try:
-                words = loop.run_until_complete(phrase_engine.generate_words())
-                self._current_phrases = words + [OTHER_LABEL]
+                words = phrase_engine.get_words_for_step()
+                labels = [OTHER_LABEL]
+                if phrase_engine.is_skippable:
+                    labels.insert(0, SKIP_LABEL)
+                self._current_phrases = words + labels
                 self._flasher.set_phrases(self._current_phrases)
-                event_bus.emit(Event(
-                    type=EventType.PHRASES_UPDATED,
-                    data={"phrases": self._current_phrases},
-                ))
+                self._emit_grammar_update(words)
                 time.sleep(0.5)
                 self._start_flash_cycle()
             except Exception:
                 logger.exception("Failed to refresh phrases")
-            finally:
-                loop.close()
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -394,7 +445,7 @@ class BCIOrchestrator:
             data = _np2.pad(data, ((pad, 0), (0, 0)), mode="edge")
         return data.T
 
-    _CONFIDENCE_THRESHOLD = 0.70
+    _CONFIDENCE_THRESHOLD = 0.63
     _VOTE_WINDOW = 9
 
     def _majority_vote(self) -> tuple[str, float]:
@@ -449,14 +500,24 @@ class BCIOrchestrator:
             if voted_name == "idle" or voted_conf < self._CONFIDENCE_THRESHOLD:
                 return
 
+            # Require the full vote window to be populated before firing any gesture
+            # so a single high-confidence frame cannot trigger immediately on startup.
+            if len(self._gesture_vote_buffer) < self._VOTE_WINDOW:
+                return
+
+            now = time.time()
             logger.info("Gesture detected: %s (voted_conf=%.2f)", voted_name, voted_conf)
 
             if voted_name == "blink":
+                self._eegnet_blink_time = now
+                self._eegnet_blink_conf = voted_conf
                 event_bus.emit(Event(
                     type=EventType.BLINK_DETECTED,
                     data={"peak_uv": 0, "channel": "ML", "confidence": voted_conf},
                 ))
             elif voted_name == "clench":
+                self._eegnet_clench_time = now
+                self._eegnet_clench_conf = voted_conf
                 event_bus.emit(Event(
                     type=EventType.CLENCH_DETECTED,
                     data={"rms": 0, "confidence": voted_conf},
@@ -467,12 +528,18 @@ class BCIOrchestrator:
     # ── Selection state machine ────────────────────────────────
 
     def start_selection(self) -> dict:
-        """Begin warmup → calibration → highlighting cycle."""
+        """Begin warmup → blink cal → clench cal → highlighting cycle."""
         if self._sel_state != SelectionState.IDLE:
             return {"error": "Selection already active"}
         if not self._current_phrases:
-            return {"error": "No phrases loaded"}
+            words = phrase_engine.get_words_for_step()
+            labels = [OTHER_LABEL]
+            if phrase_engine.is_skippable:
+                labels.insert(0, SKIP_LABEL)
+            self._current_phrases = words + labels
+            self._emit_grammar_update(words)
 
+        phrase_engine.clear_sentence()
         self._sel_state = SelectionState.WARMUP
         self._sel_warmup_start = time.time()
         self._sel_last_progress_emit = 0.0
@@ -481,6 +548,10 @@ class BCIOrchestrator:
         self._sel_last_blink_time = 0.0
         self._sel_blink_threshold = DEFAULT_BLINK_THRESHOLD
         self._gesture_vote_buffer.clear()
+        self._clench_cal_count = 0
+        self._clench_cal_rms_values.clear()
+        self._last_clench_action_time = 0.0
+        self._clench_pending_time = 0.0
 
         logger.info("Selection started — entering warmup phase")
         event_bus.emit(Event(
@@ -513,6 +584,10 @@ class BCIOrchestrator:
             "blink_threshold": self._sel_blink_threshold,
             "calibration_blinks": self._sel_cal_blinks,
             "phrases": self._current_phrases,
+            "grammar_step": phrase_engine.current_step_name,
+            "grammar_step_index": phrase_engine.step_index,
+            "skippable": phrase_engine.is_skippable,
+            "selected_slots": phrase_engine.selected_slots,
         }
 
     def _detect_raw_blink(self) -> tuple[bool, float]:
@@ -530,6 +605,16 @@ class BCIOrchestrator:
             return max_pp > self._sel_blink_threshold, max_pp
         except Exception:
             return False, 0.0
+
+    def _detect_blink(self) -> tuple[bool, float]:
+        """Detect blink using EEGNet if available, then fall back to raw detection."""
+        if deep_trainer.gesture_model is not None:
+            now = time.time()
+            age = now - self._eegnet_blink_time
+            if age < 0.5 and self._eegnet_blink_conf >= self._CONFIDENCE_THRESHOLD:
+                self._eegnet_blink_time = 0.0
+                return True, self._eegnet_blink_conf * 200
+        return self._detect_raw_blink()
 
     def _run_selection_tick(self) -> None:
         """Advance the selection state machine (called ~every 100ms)."""
@@ -567,7 +652,7 @@ class BCIOrchestrator:
                 ))
 
         elif self._sel_state == SelectionState.CALIBRATING:
-            is_blink, amplitude = self._detect_raw_blink()
+            is_blink, amplitude = self._detect_blink()
             if is_blink and now - self._sel_last_blink_time > DEBOUNCE_PERIOD:
                 self._sel_last_blink_time = now
                 self._sel_cal_blinks += 1
@@ -589,7 +674,7 @@ class BCIOrchestrator:
                 if self._sel_cal_blinks >= CALIBRATION_BLINKS:
                     self._sel_blink_threshold = min(self._sel_cal_amplitudes) * 0.7
                     logger.info(
-                        "Calibration complete — threshold set to %.1f uV",
+                        "Blink calibration complete — threshold set to %.1f uV",
                         self._sel_blink_threshold,
                     )
                     event_bus.emit(Event(
@@ -601,22 +686,25 @@ class BCIOrchestrator:
                             "threshold": round(self._sel_blink_threshold, 1),
                         },
                     ))
-                    self._sel_state = SelectionState.HIGHLIGHTING
-                    self._sel_highlight_index = 0
-                    self._sel_highlight_start = now
-                    self._sel_last_blink_time = now
-                    phrase = self._current_phrases[0] if self._current_phrases else ""
+                    self._sel_state = SelectionState.CLENCH_CALIBRATING
+                    self._clench_cal_count = 0
+                    self._clench_cal_rms_values.clear()
+                    self._clench_cal_last_time = now
+                    logger.info("Entering clench calibration (clench %d times)", CALIBRATION_CLENCHES)
                     event_bus.emit(Event(
-                        type=EventType.HIGHLIGHT_CHANGED,
+                        type=EventType.CLENCH_CALIBRATION_STATUS,
                         data={
-                            "index": 0,
-                            "phrase": phrase,
-                            "total": len(self._current_phrases),
+                            "state": "calibrating",
+                            "clenches_detected": 0,
+                            "clenches_needed": CALIBRATION_CLENCHES,
                         },
                     ))
 
+        elif self._sel_state == SelectionState.CLENCH_CALIBRATING:
+            self._run_clench_calibration_tick(now)
+
         elif self._sel_state == SelectionState.HIGHLIGHTING:
-            is_blink, amplitude = self._detect_raw_blink()
+            is_blink, amplitude = self._detect_blink()
             if is_blink and now - self._sel_last_blink_time > DEBOUNCE_PERIOD:
                 self._sel_last_blink_time = now
                 self._sel_confirmed_index = self._sel_highlight_index
@@ -660,49 +748,80 @@ class BCIOrchestrator:
         elif self._sel_state == SelectionState.CONFIRMING:
             if now - self._sel_confirm_start >= CONFIRM_DISPLAY_SEC:
                 idx = self._sel_confirmed_index
-                is_other = idx == 5
+                phrase = (
+                    self._current_phrases[idx]
+                    if idx < len(self._current_phrases)
+                    else "?"
+                )
 
-                if is_other:
-                    logger.info("'Other' selected — generating new words")
+                if phrase == SKIP_LABEL:
+                    logger.info("Step '%s' skipped", phrase_engine.current_step_name)
+                    phrase_engine.skip_step()
                     self._sel_state = SelectionState.EXECUTING
-                    self._refresh_words_and_resume(is_other=True)
+                    self._handle_post_selection()
+                elif phrase == OTHER_LABEL:
+                    logger.info("'Other' selected — loading more words for '%s'", phrase_engine.current_step_name)
+                    self._sel_state = SelectionState.EXECUTING
+                    self._refresh_grammar_words_and_resume(is_other=True)
                 else:
-                    word = (
-                        self._current_phrases[idx]
-                        if idx < len(self._current_phrases)
-                        else "?"
-                    )
-                    phrase_engine.select_word(word)
-                    logger.info("Word selected: '%s'", word)
+                    phrase_engine.select_word_for_step(phrase)
+                    logger.info("Word selected: '%s' for step '%s'", phrase, phrase_engine.current_step_name)
                     event_bus.emit(Event(
                         type=EventType.WORD_SELECTED,
                         data={
-                            "word": word,
+                            "word": phrase,
                             "sentence": phrase_engine.sentence,
+                            "grammar_step": phrase_engine.current_step_name,
+                            "selected_slots": phrase_engine.selected_slots,
                         },
                     ))
                     self._sel_state = SelectionState.EXECUTING
-                    self._refresh_words_and_resume(is_other=False)
+                    self._handle_post_selection()
 
-    def _refresh_words_and_resume(self, is_other: bool = False) -> None:
-        """Generate new words in background and resume highlighting."""
+    def _handle_post_selection(self) -> None:
+        """After a word is selected or step skipped, decide next action."""
+        if phrase_engine.is_sentence_complete():
+            self._auto_send_sentence()
+        else:
+            self._refresh_grammar_words_and_resume()
+
+    def _auto_send_sentence(self) -> None:
+        """Auto-trigger done/send when all required grammar slots are filled."""
+        sentence_text = phrase_engine.sentence_text
+        sentence_list = phrase_engine.sentence
+        logger.info("Sentence auto-sent: '%s'", sentence_text)
+
+        phrase_engine.done_send()
+
+        event_bus.emit(Event(
+            type=EventType.SENTENCE_AUTO_SENT,
+            data={"sentence_text": sentence_text, "sentence": sentence_list},
+        ))
+        event_bus.emit(Event(
+            type=EventType.SELECTION_EXECUTED,
+            data={"phrase": sentence_text, "sentence": sentence_list, "action": "auto_send"},
+        ))
+        event_bus.emit(Event(
+            type=EventType.SENTENCE_CLEARED,
+            data={"spoken": sentence_text},
+        ))
+
+        self._refresh_grammar_words_and_resume()
+
+    def _refresh_grammar_words_and_resume(self, is_other: bool = False) -> None:
+        """Load words for the current grammar step and resume highlighting."""
         def _do():
-            loop = asyncio.new_event_loop()
             try:
                 if is_other:
-                    words = loop.run_until_complete(phrase_engine.generate_other_words())
+                    words = phrase_engine.get_other_words()
                 else:
-                    words = loop.run_until_complete(phrase_engine.generate_words())
-                self._current_phrases = words + [OTHER_LABEL]
+                    words = phrase_engine.get_words_for_step()
+                labels = [OTHER_LABEL]
+                if phrase_engine.is_skippable:
+                    labels.insert(0, SKIP_LABEL)
+                self._current_phrases = words + labels
                 self._flasher.set_phrases(self._current_phrases)
-                event_bus.emit(Event(
-                    type=EventType.WORDS_UPDATED,
-                    data={
-                        "words": words,
-                        "phrases": self._current_phrases,
-                        "sentence": phrase_engine.sentence,
-                    },
-                ))
+                self._emit_grammar_update(words)
                 self._sel_highlight_index = 0
                 self._sel_highlight_start = time.time()
                 self._sel_last_blink_time = time.time()
@@ -716,22 +835,94 @@ class BCIOrchestrator:
                     },
                 ))
             except Exception:
-                logger.exception("Failed to refresh words")
+                logger.exception("Failed to refresh grammar words")
                 self._sel_state = SelectionState.HIGHLIGHTING
                 self._sel_highlight_start = time.time()
-            finally:
-                loop.close()
         threading.Thread(target=_do, daemon=True).start()
+
+    def _refresh_words_and_resume(self, is_other: bool = False) -> None:
+        """Backward compat wrapper."""
+        self._refresh_grammar_words_and_resume(is_other=is_other)
 
     def _refresh_phrases_async(self) -> None:
         """Compatibility wrapper."""
-        self._refresh_words_and_resume(is_other=False)
+        self._refresh_grammar_words_and_resume(is_other=False)
+
+    def _run_clench_calibration_tick(self, now: float) -> None:
+        """Handle clench calibration: user clenches 3 times to set personal threshold."""
+        try:
+            raw_samples = redis_store.get_recent_raw(seconds=0.3)
+            if len(raw_samples) < 30:
+                return
+            data = np.array(
+                [[s["tp9"], s["tp10"]] for s in raw_samples], dtype=np.float32,
+            )
+            rms_tp9 = float(np.sqrt(np.mean(np.square(data[:, 0]))))
+            rms_tp10 = float(np.sqrt(np.mean(np.square(data[:, 1]))))
+            rms = max(rms_tp9, rms_tp10)
+
+            if rms >= config.CLENCH_RMS_THRESHOLD and now - self._clench_cal_last_time > 1.5:
+                self._clench_cal_last_time = now
+                self._clench_cal_count += 1
+                self._clench_cal_rms_values.append(rms)
+                logger.info(
+                    "Clench calibration %d/%d (rms=%.1f)",
+                    self._clench_cal_count, CALIBRATION_CLENCHES, rms,
+                )
+                event_bus.emit(Event(
+                    type=EventType.CLENCH_CALIBRATION_STATUS,
+                    data={
+                        "state": "calibrating",
+                        "clenches_detected": self._clench_cal_count,
+                        "clenches_needed": CALIBRATION_CLENCHES,
+                    },
+                ))
+
+                if self._clench_cal_count >= CALIBRATION_CLENCHES:
+                    vals = np.array(self._clench_cal_rms_values)
+                    baseline = float(vals.mean())
+                    std = float(vals.std()) if len(vals) > 1 else 5.0
+                    threshold = max(baseline * 0.5, np.percentile(vals, 40))
+                    self._dynamic_clench_threshold = threshold
+                    config.CLENCH_RMS_THRESHOLD = threshold
+                    logger.info(
+                        "Clench calibration complete — dynamic threshold=%.1f (mean=%.1f, std=%.1f)",
+                        threshold, baseline, std,
+                    )
+                    event_bus.emit(Event(
+                        type=EventType.CLENCH_CALIBRATION_STATUS,
+                        data={
+                            "state": "complete",
+                            "clenches_detected": CALIBRATION_CLENCHES,
+                            "clenches_needed": CALIBRATION_CLENCHES,
+                            "threshold": round(threshold, 1),
+                        },
+                    ))
+                    self._enter_highlighting(now)
+        except Exception:
+            logger.debug("Clench calibration tick error", exc_info=True)
+
+    def _enter_highlighting(self, now: float) -> None:
+        """Transition to the highlighting state."""
+        self._sel_state = SelectionState.HIGHLIGHTING
+        self._sel_highlight_index = 0
+        self._sel_highlight_start = now
+        self._sel_last_blink_time = now
+        phrase = self._current_phrases[0] if self._current_phrases else ""
+        event_bus.emit(Event(
+            type=EventType.HIGHLIGHT_CHANGED,
+            data={
+                "index": 0,
+                "phrase": phrase,
+                "total": len(self._current_phrases),
+            },
+        ))
 
     def done_send(self) -> dict:
-        """Done/Send: return sentence, clear it, generate fresh words, keep looping."""
+        """Done/Send: assemble sentence, clear it, generate fresh words, keep looping."""
         sentence_text = phrase_engine.sentence_text
         sentence_list = phrase_engine.sentence
-        if not sentence_list:
+        if not phrase_engine.has_selections():
             return {"error": "No sentence to send"}
 
         phrase_engine.done_send()
@@ -748,7 +939,7 @@ class BCIOrchestrator:
 
         if self._sel_state in (SelectionState.HIGHLIGHTING, SelectionState.EXECUTING):
             self._sel_state = SelectionState.EXECUTING
-            self._refresh_words_and_resume(is_other=False)
+            self._refresh_grammar_words_and_resume(is_other=False)
 
         return {"status": "sent", "sentence": sentence_text}
 
